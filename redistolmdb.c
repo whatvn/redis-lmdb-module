@@ -10,91 +10,114 @@
         "%s:%d: %s: %s\n", __FILE__, __LINE__, msg, mdb_strerror(rc)), abort()))
 
 static MDB_env *env;
+struct sharedObjectsStruct shared;
 
-void lmdbgetCommand(redisClient *c) {
-    int rc;
+int write_db(robj *key, msgpack_sbuffer *buf) {
+    int rc = 0;
     MDB_val mdb_key, mdb_data;
     MDB_dbi dbi;
     MDB_txn *txn;
-    //    static MDB_cursor *cursor;
-    if (c->argc != 2) {
-        addReplyError(c, "lget command  takes 2 arguments");
-        return;
+    mdb_key.mv_size = strlen((char *) key->ptr);
+    mdb_key.mv_data = (char *) key->ptr;
+
+    mdb_data.mv_size = buf->size;
+    mdb_data.mv_data = buf->data;
+    /*
+    fprintf(stderr, "key: %s, value: %s", (char *) mdb_key.mv_data, (char *) mdb_data.mv_data);
+     */
+    rc = mdb_txn_begin(env, NULL, 0, &txn);
+    if (rc) {
+        goto out;
     }
-    struct redisObject* key = c->argv[1];
+    rc = mdb_dbi_open(txn, NULL, 0, &dbi);
+    if (rc) {
+        goto out;
+    }
+    rc = mdb_put(txn, dbi, &mdb_key, &mdb_data, 0);
+out:
+    if(txn) {
+        mdb_txn_commit(txn);
+    }
+    return rc;
+}
+
+int read_db(robj *key, MDB_val *val) {
+    int rc = 0;
+    MDB_val mdb_key;
+    MDB_dbi dbi;
+    MDB_txn *txn;
+    //    static MDB_cursor *cursor;
+    //    struct redisObject* key = c->argv[1];
     /*
     fprintf(stderr, "key: %s, size: %d\n", key->ptr, strlen(key->ptr));
      */
     mdb_key.mv_size = strlen((const char*) key->ptr);
     mdb_key.mv_data = key->ptr;
-    E(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
-    E(mdb_dbi_open(txn, NULL, 0, &dbi));
-
+    rc = mdb_txn_begin(env, NULL, MDB_RDONLY, &txn);
     if (rc) {
-        addReplyError(c, "error: mdb key cannot be retrieved at this time ");
-        return;
+        goto out;
     }
-
-    rc = mdb_get(txn, dbi, &mdb_key, &mdb_data);
-    if (rc == MDB_NOTFOUND) {
-        //        mdb_cursor_close(cursor);
+    rc = mdb_dbi_open(txn, NULL, 0, &dbi);
+    if (rc) {
+        goto out;
+    }
+    rc = mdb_get(txn, dbi, &mdb_key, val);
+out:
+    if(txn) {
         mdb_txn_abort(txn);
-        addReplyError(c, "(nil)");
+    }
+    return rc;
+}
+
+void lmdbgetCommand(redisClient *c) {
+    int rc;
+    if (c->argc != 2) {
+        addReplyError(c, "lget command  takes 2 arguments");
         return;
     }
+    MDB_val val;
+    struct redisObject* key = c->argv[1];
+    rc = read_db(key, &val);
+    /*
+    fprintf(stderr, "key: %s, size: %d\n", key->ptr, strlen(key->ptr));
+     */
+
+    if (rc == MDB_NOTFOUND) {
+        fprintf(stderr, "key: %s not found\n", key->ptr);
+        addReply(c, shared.nullbulk) ;
+        return;
+    } else if (rc == MDB_SUCCESS) {
+        char msg[strlen((const char*) val.mv_data) + sizeof ("\r\n")];
+        sprintf(msg, "+%s\r\n", (const char*) val.mv_data);
+        //    sds rsp = sdsnew(msg);
+        //    robj *o = createObject(REDIS_STRING, rsp);
+        //    mdb_cursor_close(cursor);
+        addReplyString(c, msg, sizeof (msg));
+        return;
+    }
+    addReplyError(c, "error: mdb key cannot be retrieved at this time ");
     /*
     fprintf(stderr, "key: %s, value: %s", (const char*) mdb_key.mv_data,
             (const char*) mdb_data.mv_data);
      */
-    char msg[strlen((const char*) mdb_data.mv_data) + sizeof ("\r\n")];
-    sprintf(msg, "+%s\r\n", (const char*) mdb_data.mv_data);
-    //    sds rsp = sdsnew(msg);
-    //    robj *o = createObject(REDIS_STRING, rsp);
-    //    mdb_cursor_close(cursor);
-    mdb_txn_abort(txn);
-    addReplyString(c, msg, sizeof (msg));
-    //    addReply(c, o);
 }
 
 void lmdbsetCommand(redisClient *c) {
     int rc;
-    MDB_val mdb_key, mdb_data;
-    MDB_dbi dbi;
-    MDB_txn *txn;
-    //
-    //    if (c->argc != 2) {
-    //        addReplyError(c, "lset command takes 2 arguments");
-    //        return;
-    //    }
 
-    struct redisObject* key = c->argv[1];
-    struct redisObject* val = c->argv[2];
-
-    mdb_key.mv_size = strlen((char *) key->ptr);
-    mdb_key.mv_data = (char *) key->ptr;
-
-    mdb_data.mv_size = strlen((char *) val->ptr);
-    mdb_data.mv_data = (char *) val->ptr;
+    if (c->argc != 3) {
+        addReplyError(c, "lset command takes 2 arguments");
+        return;
+    }
+    robj *key = c->argv[1];
+    msgpack_sbuffer *buf = (msgpack_sbuffer*) c->argv[2]->ptr;
+    rc = write_db(key, buf);
     /*
     fprintf(stderr, "key: %s, value: %s", (char *) mdb_key.mv_data, (char *) mdb_data.mv_data);
      */
-    E(mdb_txn_begin(env, NULL, 0, &txn));
-    E(mdb_dbi_open(txn, NULL, 0, &dbi));
     if (rc) {
-        addReplyError(c, "error: mdb cannot open transaction at this time ");
-        return;
+        addReplyError(c, "Cannot set key");
     }
-    E(mdb_put(txn, dbi, &mdb_key, &mdb_data, 0));
-    if (rc) {
-        addReplyError(c, "error: Cannot put key");
-        return;
-    }
-    mdb_txn_commit(txn);
-    if (rc) {
-        addReplyError(c, "error: Cannot commit put transaction");
-        return;
-    }
-    //    E(mdb_txn_commit(txn));
     sds rsp = sdsnew("+OK\r\n");
     robj *o = createObject(REDIS_STRING, rsp);
     addReply(c, o);
@@ -113,40 +136,15 @@ void lmdbmsetCommand(redisClient *c) {
         addReplyError(c, "wrong number of arguments");
     }
     int rc;
-    MDB_val mdb_key, mdb_data;
-    MDB_dbi dbi;
-    MDB_txn *txn;
-    robj *cmd = c->argv[0];
     robj *key = c->argv[1];
-    msgpack_sbuffer *val = (msgpack_sbuffer) c->argv[2]->ptr;
-
-
-
-    mdb_key.mv_size = strlen((char *) key->ptr);
-    mdb_key.mv_data = (char *) key->ptr;
-
-    mdb_data.mv_size = val->size;
-    mdb_data.mv_data = val->data;
+    msgpack_sbuffer *buf = (msgpack_sbuffer*) c->argv[2]->ptr;
+    rc = write_db(key, buf);
     /*
     fprintf(stderr, "key: %s, value: %s", (char *) mdb_key.mv_data, (char *) mdb_data.mv_data);
      */
-    E(mdb_txn_begin(env, NULL, 0, &txn));
-    E(mdb_dbi_open(txn, NULL, 0, &dbi));
     if (rc) {
-        addReplyError(c, "error: mdb cannot open transaction at this time ");
-        return;
+        addReplyError(c, "Cannot set key");
     }
-    E(mdb_put(txn, dbi, &mdb_key, &mdb_data, 0));
-    if (rc) {
-        addReplyError(c, "error: Cannot put key");
-        return;
-    }
-    mdb_txn_commit(txn);
-    if (rc) {
-        addReplyError(c, "error: Cannot commit put transaction");
-        return;
-    }
-    //    E(mdb_txn_commit(txn));
     sds rsp = sdsnew("+OK\r\n");
     robj *o = createObject(REDIS_STRING, rsp);
     addReply(c, o);
@@ -186,7 +184,6 @@ video_detail *unpack(receiver* r) {
     char* buf;
     size_t recv_len;
     int recv_count = 0;
-    int i = 0;
     video_detail *vdu = NULL;
 
     msgpack_unpacked_init(&result);
@@ -196,7 +193,7 @@ video_detail *unpack(receiver* r) {
     }
     buf = msgpack_unpacker_buffer(unp);
 
-    vdu = malloc(sizeof (video_detail));
+    vdu = zmalloc(sizeof (video_detail));
     recv_len = receiver_recv(r, buf, EACH_RECV_SIZE);
     msgpack_unpacker_buffer_consumed(unp, recv_len);
 
@@ -230,7 +227,7 @@ video_detail *unpack(receiver* r) {
         if (ret == MSGPACK_UNPACK_PARSE_ERROR) {
             printf("The data in the buf is invalid format.\n");
             msgpack_unpacked_destroy(&result);
-            return;
+            return NULL;
         }
         if (msgpack_unpacker_buffer_capacity(unp) < EACH_RECV_SIZE) {
             bool expanded = msgpack_unpacker_reserve_buffer(unp, 100);
@@ -243,19 +240,6 @@ video_detail *unpack(receiver* r) {
     msgpack_unpacked_destroy(&result);
     return vdu;
 }
-
-//int main(void) {
-//    receiver r;
-//    video_detail *vd = NULL;
-//    vd = malloc(sizeof(video_detail));
-//    vd->video_id = 1000;
-//    vd->video_thumb_url = "hihihehe";
-//    vd->video_title = "veryverylongveryverylongveryverylongveryverylongveryverylongveryverylong";
-//    receiver_init(&r, vd);
-//    unpack(&r);
-//
-//    return 0;
-//}
 
 void *load() {
     int rc;
@@ -287,9 +271,9 @@ struct redisModule redisModuleDetail = {
 
 struct redisCommand redisCommandTable[] = {
     {"lmdbget", lmdbgetCommand, 2, "rF", 0, NULL, 1, 1, 1, 0, 0},
-    {"lmdbget", lmdbmgetCommand, -2, "rF", 0, NULL, 1, 1, 1, 0, 0},
+    //    {"lmdbget", lmdbmgetCommand, -2, "rF", 0, NULL, 1, 1, 1, 0, 0},
     {"lmdbset", lmdbsetCommand, -3, "wm", 0, NULL, 1, 1, 1, 0, 0},
-    {"lmdbset", lmdbmsetCommand, -3, "wm", 0, NULL, 1, -1, 2, 0, 0},
+    //    {"lmdbset", lmdbmsetCommand, -3, "wm", 0, NULL, 1, -1, 2, 0, 0},
     /* function from Redis */
     {0} /* Always end your command table with {0}
           * If you forget, you will be reminded with a segfault on load. */
